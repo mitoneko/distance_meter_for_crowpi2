@@ -1,5 +1,7 @@
 /dts-v1/;
 /plugin/;
+#include <dt-bindings/pinstrl/bcm2835.h>
+#include <dt-bindings/gpio/gpio.h>
 
 /{
     compatible = "brcm,bcm2835";
@@ -8,9 +10,14 @@
         // Configure the gpio pin controller
         target = <&gpio>;
         __overlay__ {
-                pin_state: beep-pin@0 {
-                        brcm,pins = <18>; // gpio number
+                distance_pin_echo: distance_pin_echo {
+                        brcm,pins = <26>; // gpio number
                         brcm,function = <1>; // 0 = input, 1 = output
+                        brcm,pull = <0>; // 0 = none, 1 = pull down, 2 = pull up
+                };
+                distance_pin_trig: distance_pin_trig {
+                        brcm,pins = <16>; // gpio number
+                        brcm,function = <0>; // 0 = input, 1 = output
                         brcm,pull = <0>; // 0 = none, 1 = pull down, 2 = pull up
                 };
         };
@@ -19,11 +26,11 @@
     fragment@1 {
         target-path = "/";
         __overlay__ {
-            beep: beep@0 {
-                compatible = "crowpi2-beep";
+            distance: distance {
+                compatible = "crowpi2-distance";
                 pinctrl-names = "default";
-                pinctrl-0 = <&pin_state>;
-                gpios = <&gpio 18 0>;
+                pinctrl-0 = <&distance_pin_echo &distance_pin_trig>;
+                gpios = <&gpio 26 0>, <gpio 16 0>; // para-3: active-high=0 active-low=1
                 status = "okay";
             };
         };
