@@ -1,7 +1,7 @@
 /dts-v1/;
 /plugin/;
-#include <dt-bindings/pinstrl/bcm2835.h>
-#include <dt-bindings/gpio/gpio.h>
+//#include <dt-bindings/pinstrl/bcm2835.h>;
+//#include <dt-bindings/gpio/gpio.h>;
 
 /{
     compatible = "brcm,bcm2835";
@@ -30,7 +30,7 @@
                 compatible = "crowpi2-distance";
                 pinctrl-names = "default";
                 pinctrl-0 = <&distance_pin_echo &distance_pin_trig>;
-                gpios = <&gpio 26 0>, <gpio 16 0>; // para-3: active-high=0 active-low=1
+                gpios = <&gpio 26 0>, <&gpio 16 0>; // para-3: active-high=0 active-low=1
                 status = "okay";
             };
         };
