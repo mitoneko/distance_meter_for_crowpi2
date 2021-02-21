@@ -13,7 +13,7 @@
 #include <asm/current.h>
 #include <asm/uaccess.h>
 
-#define DRIVER_NAME "beep"
+#define DRIVER_NAME "Distance_Meter"
 
 static const unsigned int MINOR_BASE = 0; // udev minor番号の始まり
 static const unsigned int MINOR_NUM = 1;  // udev minorの個数
@@ -23,7 +23,8 @@ struct distance_device_info {
     unsigned int major; // udev major番号
     struct cdev cdev;
     struct class *class;
-    struct gpio_desc *gpio;
+    struct gpio_desc *trig_gpio;
+    struct gpio_desc *echo_gpio;
     struct timer_list ringing_timer;
     unsigned long ringing_time_jiffies; // 鳴動時間(単位:jiffies) 0で永遠
 };
@@ -42,18 +43,20 @@ static int distance_close(struct inode *inode, struct file *file) {
 }
 
 static ssize_t distance_read(struct file *fp, char __user *buf, size_t count, loff_t *f_pos) {
-    pr_devl("%s: read\n", __func__);
+    if (count == 0) return 0;
+    if (buf == NULL) return -EINVAL;
+    pr_devel("%s: read\n", __func__);
     return 0;
 }
 
 static ssize_t distance_write(struct file *fp, const char __user *buf, size_t count, loff_t *f_pos) {
-    pr_devl("%s: wrote.\n", __func__);
+    pr_devel("%s: wrote.\n", __func__);
     return count;
 }
 
 /* 仮に残しておく */
 void beep_off_when_timeup(struct timer_list *timer) {
-    struct beep_device_info *ddev = container_of(timer, struct distance_device_info, ringing_timer);
+    struct distance_device_info *ddev = container_of(timer, struct distance_device_info, ringing_timer);
     if (!ddev) {
         pr_err("%s:デバイス情報取得失敗\n", __func__);
         return;
@@ -98,7 +101,7 @@ static int make_udev(struct distance_device_info *ddev, const char* name) {
     ddev->major = MAJOR(dev);
 
     /* カーネルへのキャラクタデバイスドライバ登録 */
-    cdev_init(&ddev->cdev, &beep_fops);
+    cdev_init(&ddev->cdev, &distance_fops);
     ddev->cdev.owner = THIS_MODULE;
     ret = cdev_add(&ddev->cdev, dev, MINOR_NUM);
     if (ret != 0) {
@@ -129,10 +132,9 @@ err:
 
 // キャラクタデバイス及び/dev/distanceの登録解除
 static void remove_udev(struct distance_device_info *ddev) {
-    dev_t dev = MKDEV(bdev->major, MINOR_BASE);
-    device_destroy(bdev->class, MKDEV(bdev->major, 0));
-    }
-    class_destroy(bdev->class); /* クラス登録解除 */
+    dev_t dev = MKDEV(ddev->major, MINOR_BASE);
+    device_destroy(ddev->class, MKDEV(ddev->major, 0));
+    class_destroy(ddev->class); /* クラス登録解除 */
     cdev_del(&ddev->cdev); /* デバイス除去 */
     unregister_chrdev_region(dev, MINOR_NUM); /* メジャー番号除去 */
 }
@@ -183,7 +185,7 @@ static ssize_t write_beep_ringing_time(struct device *dev, struct device_attribu
 // sysfs(/sys/device/platform/beep@0/beep_ringing_time)の生成
 static struct device_attribute dev_attr_beep_ringing_time = {
     .attr = {
-        .name = "hennsuuno_namae ni naru",
+        .name = "hennsuuno_namae_ni_naru",
         .mode = S_IRUGO | S_IWUGO,
     },
     .show = NULL,
@@ -191,11 +193,12 @@ static struct device_attribute dev_attr_beep_ringing_time = {
 };
 
 static int make_sysfs(struct device *dev) {
-    return device_create_file(dev, &dev_attr_beep_ringing_time);
+    //return device_create_file(dev, &dev_attr_beep_ringing_time);
+    return 0;
 }
 
 static void remove_sysfs(struct device *dev) {
-    device_remove_file(dev, &dev_attr_beep_ringing_time);
+    //device_remove_file(dev, &dev_attr_beep_ringing_time);
 }
 
 // ドライバの初期化　及び　後始末
@@ -212,13 +215,13 @@ static int distance_probe(struct platform_device *p_dev) {
     int result;
 
     if (!dev->of_node) {
-        pr_alert("%s:Not Exist of_node for BEEP DRIVER. Check DTB\n", __func__);
+        pr_alert("%s:Not Exist of_node for DISTANCE METER DRIVER. Check DTB\n", __func__);
         result = -ENODEV;
         goto err;
     }
 
     // デバイス情報のメモリ確保と初期化
-    ddev = (struct beep_device_info*)devm_kzalloc(dev, sizeof(struct beep_device_info), GFP_KERNEL);
+    ddev = (struct distance_device_info*)devm_kzalloc(dev, sizeof(struct distance_device_info), GFP_KERNEL);
     if (!ddev) {
         pr_alert("%s: デバイス情報メモリ確保失敗\n", __func__);
         result = -ENOMEM;
@@ -227,14 +230,17 @@ static int distance_probe(struct platform_device *p_dev) {
     dev_set_drvdata(dev, ddev);
 
     // gpioの確保と初期化
-    // *************************************
-    // *todo ２つ取れるように改造すること。*
-    // *************************************
-    ddev->gpio = devm_gpiod_get(dev, NULL, GPIOD_OUT_LOW);
-    if (IS_ERR(ddev->gpio)) {
-        result = -PTR_ERR(ddev->gpio);
-        pr_alert("%s: can not get GPIO.ERR(%d)\n", __func__, result);
+    ddev->echo_gpio = devm_gpiod_get_index(dev, NULL, 0, GPIOD_IN);
+    if (IS_ERR(ddev->echo_gpio)) {
+        result = -PTR_ERR(ddev->echo_gpio);
+        pr_alert("%s: can not get echo GPIO. ERR(%d)\n", __func__, result);
         goto err;
+    }
+    ddev->trig_gpio = devm_gpiod_get_index(dev, NULL, 1, GPIOD_OUT_LOW);
+    if (IS_ERR(ddev->trig_gpio)) {
+        result = -PTR_ERR(ddev->trig_gpio);
+        pr_alert("%s: can not get triger GPIO. ERR(%d)\n", __func__, result);
+        goto err_trig;
     }
 
     // udevの生成
@@ -262,22 +268,24 @@ static int distance_probe(struct platform_device *p_dev) {
 err_sysfs:
     remove_udev(ddev);
 err_udev:
-    gpiod_put(ddev->gpio);
+    gpiod_put(ddev->trig_gpio);
+err_trig:
+    gpiod_put(ddev->echo_gpio);
 err:
     return result;
 }
 
 static int distance_remove(struct platform_device *p_dev) {
     struct distance_device_info *ddev = dev_get_drvdata(&p_dev->dev);
-    remove_udev(bdev);
+    remove_udev(ddev);
     remove_sysfs(&p_dev->dev);
 
     // gpioデバイスの開放
-    // ************************
-    // 複数の開放が必要になる *
-    // ************************
-    if (ddev->gpio) {
-        gpiod_put(ddev->gpio);
+    if (ddev->echo_gpio) {
+        gpiod_put(ddev->echo_gpio);
+    }
+    if (ddev->trig_gpio) {
+        gpiod_put(ddev->trig_gpio);
     }
 
     //多分、復活する.

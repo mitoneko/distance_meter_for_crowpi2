@@ -5,4 +5,6 @@
 *.symvers
 *.mod
 *.order
+*.ko
 *.dtbo
+tags
