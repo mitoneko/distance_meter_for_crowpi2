@@ -8,5 +8,5 @@
 *.ko
 *.dtbo
 tags
-./dtc
-./make_crowpi
+dtc
+make_crowpi
