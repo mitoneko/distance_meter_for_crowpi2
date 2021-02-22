@@ -9,6 +9,7 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/gpio/consumer.h>
+#include <linux/interrupt.h>
 #include <linux/timer.h>
 #include <linux/delay.h>
 #include <linux/ktime.h>
@@ -28,13 +29,15 @@ struct distance_device_info {
     struct class *class;
     struct gpio_desc *trig_gpio;
     struct gpio_desc *echo_gpio;
+    ktime_t echo_start;
+    int echo_length; // 単位:ns 信号幅は、ハードウェア定義により32ms以下である。
+    bool is_measuring;
     struct timer_list ringing_timer;
     unsigned long ringing_time_jiffies; // 鳴動時間(単位:jiffies) 0で永遠
 };
 
 // /dev/distance配下のアクセス関数
 
-// デバイス情報を取得し、file構造体に保存する。
 static int distance_open(struct inode *inode, struct file *file) {
     struct distance_device_info *ddev = container_of(inode->i_cdev, struct distance_device_info, cdev);
     file->private_data = ddev;
@@ -54,8 +57,6 @@ static int distance_close(struct inode *inode, struct file *file) {
 static ssize_t distance_read(struct file *fp, char __user *buf, size_t count, loff_t *f_pos) {
     struct distance_device_info *ddev = fp->private_data;
     uint32_t timeout_jiffies;
-    ktime_t echo_start_time;
-    ktime_t echo_time_ns;
     unsigned int result_mm;
     char result_char[result_char_size];
     size_t result_length; 
@@ -65,25 +66,23 @@ static ssize_t distance_read(struct file *fp, char __user *buf, size_t count, lo
     if (ddev == NULL) return -EBADF;
 
     gpiod_set_value(ddev->trig_gpio, 1);
+    ddev->is_measuring = true;
     msleep(1);
     gpiod_set_value(ddev->trig_gpio, 0);
-    timeout_jiffies=jiffies;
-    while (gpiod_get_value(ddev->echo_gpio) == 0) {
-        if (jiffies> timeout_jiffies+10) {
-            pr_devel("%s: echoがない・・・\n", __func__);
+
+    // is_measuring信号が落ちるまで待つ。
+    // echo_irq_handlerにて、立ち上げ・立ち下がりの処理完了で落ちる。
+    // ハードウェア仕様により38ms+パルス発信幅+アルファで落ちるはず。
+    timeout_jiffies = jiffies;
+    while (ddev->is_measuring == true) {
+        if ( jiffies - timeout_jiffies > 10) {
+            pr_devel("%s: echoの戻り信号検知が出来ない。\n", __func__);
             return -EIO;
         }
+        msleep(1);
     }
-    timeout_jiffies=jiffies;
-    echo_start_time = ktime_get();
-    while (gpiod_get_value(ddev->echo_gpio) == 1) {
-        if (jiffies > timeout_jiffies + 50) {
-            pr_devel("%s: echoが落ちない・・・\n",__func__);
-            return -EIO;
-        }
-    }
-    echo_time_ns = ktime_get() - echo_start_time;
-    result_mm = (unsigned int)div_u64(echo_time_ns , 5400);
+
+    result_mm = ddev->echo_length / 5686; //datasheetだと5400。実測で補正
     result_length = snprintf(result_char, result_char_size, "%d\n", result_mm);
     if (result_length > count) result_length=count;
     if (copy_to_user(buf, result_char, result_length)) {
@@ -94,6 +93,20 @@ static ssize_t distance_read(struct file *fp, char __user *buf, size_t count, lo
     pr_devel("%s: read(val=%s)\n", __func__, result_char);
     return result_length;
 }
+
+// echo信号の割込み処理。
+// 立ち上がり時刻を保持し、立ち下がり時に信号の長さを計算する。
+static irqreturn_t echo_irq_handler(int irq, void *device) {
+    struct distance_device_info *ddev = (struct distance_device_info *)device;
+    if (gpiod_get_value(ddev->echo_gpio) == 1) {
+        ddev->echo_start = ktime_get();
+    } else {
+        ddev->echo_length = (int)(ktime_get() - ddev->echo_start);
+        ddev->is_measuring = false;
+    }
+    return IRQ_HANDLED;
+}
+        
 
 static ssize_t distance_write(struct file *fp, const char __user *buf, size_t count, loff_t *f_pos) {
     pr_devel("%s: wrote.\n", __func__);
@@ -259,6 +272,7 @@ static int distance_probe(struct platform_device *p_dev) {
     struct device *dev = &p_dev->dev;
     struct distance_device_info *ddev;
     int result;
+    int echo_irq;
 
     if (!dev->of_node) {
         pr_alert("%s:Not Exist of_node for DISTANCE METER DRIVER. Check DTB\n", __func__);
@@ -288,6 +302,19 @@ static int distance_probe(struct platform_device *p_dev) {
         pr_alert("%s: can not get triger GPIO. ERR(%d)\n", __func__, result);
         goto err_trig;
     }
+    // echo信号用割込みの設定
+    echo_irq = gpiod_to_irq(ddev->echo_gpio);
+    if (echo_irq < 0) {
+        result = echo_irq;
+        pr_alert("%s: can not get IRQ for echo gpio. ERR(%d)\n", __func__, result);
+        goto err_echo_irq;
+    }
+    result = request_irq(echo_irq, echo_irq_handler, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, "distance_irq", ddev);
+    if (result != 0) {
+        pr_alert("%s: can not registration irq for echo gpio. ERR(%d)\n", __func__, result);
+        goto err_echo_irq;
+    }
+
 
     // udevの生成
     result = make_udev(ddev, p_dev->name);
@@ -314,6 +341,8 @@ static int distance_probe(struct platform_device *p_dev) {
 err_sysfs:
     remove_udev(ddev);
 err_udev:
+    free_irq(echo_irq, ddev);
+err_echo_irq:
     gpiod_put(ddev->trig_gpio);
 err_trig:
     gpiod_put(ddev->echo_gpio);
@@ -323,8 +352,14 @@ err:
 
 static int distance_remove(struct platform_device *p_dev) {
     struct distance_device_info *ddev = dev_get_drvdata(&p_dev->dev);
+    int echo_irq;
+
     remove_udev(ddev);
     remove_sysfs(&p_dev->dev);
+
+    // echo_gpio 割り込みハンドラの開放
+    echo_irq = gpiod_to_irq(ddev->echo_gpio);
+    free_irq(echo_irq, ddev);
 
     // gpioデバイスの開放
     if (ddev->echo_gpio) {
