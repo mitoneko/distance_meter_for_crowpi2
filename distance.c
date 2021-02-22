@@ -10,6 +10,9 @@
 #include <linux/of_device.h>
 #include <linux/gpio/consumer.h>
 #include <linux/timer.h>
+#include <linux/delay.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
 #include <asm/current.h>
 #include <asm/uaccess.h>
 
@@ -33,6 +36,9 @@ struct distance_device_info {
 
 // デバイス情報を取得し、file構造体に保存する。
 static int distance_open(struct inode *inode, struct file *file) {
+    struct distance_device_info *ddev = container_of(inode->i_cdev, struct distance_device_info, cdev);
+    file->private_data = ddev;
+
     pr_devel("%s:distance meter open\n", __func__);
     return 0;
 }
@@ -42,11 +48,51 @@ static int distance_close(struct inode *inode, struct file *file) {
     return 0;
 }
 
+// パルス幅はセンサー仕様でMAX38ms。従って、38000000/5400=7037mmを超えることはない。
+#define result_char_size  6 // 4+1(\n)+1(NULL)
+
 static ssize_t distance_read(struct file *fp, char __user *buf, size_t count, loff_t *f_pos) {
+    struct distance_device_info *ddev = fp->private_data;
+    uint32_t timeout_jiffies;
+    ktime_t echo_start_time;
+    ktime_t echo_time_ns;
+    unsigned int result_mm;
+    char result_char[result_char_size];
+    size_t result_length; 
+
     if (count == 0) return 0;
     if (buf == NULL) return -EINVAL;
-    pr_devel("%s: read\n", __func__);
-    return 0;
+    if (ddev == NULL) return -EBADF;
+
+    gpiod_set_value(ddev->trig_gpio, 1);
+    msleep(1);
+    gpiod_set_value(ddev->trig_gpio, 0);
+    timeout_jiffies=jiffies;
+    while (gpiod_get_value(ddev->echo_gpio) == 0) {
+        if (jiffies> timeout_jiffies+10) {
+            pr_devel("%s: echoがない・・・\n", __func__);
+            return -EIO;
+        }
+    }
+    timeout_jiffies=jiffies;
+    echo_start_time = ktime_get();
+    while (gpiod_get_value(ddev->echo_gpio) == 1) {
+        if (jiffies > timeout_jiffies + 50) {
+            pr_devel("%s: echoが落ちない・・・\n",__func__);
+            return -EIO;
+        }
+    }
+    echo_time_ns = ktime_get() - echo_start_time;
+    result_mm = (unsigned int)div_u64(echo_time_ns , 5400);
+    result_length = snprintf(result_char, result_char_size, "%d\n", result_mm);
+    if (result_length > count) result_length=count;
+    if (copy_to_user(buf, result_char, result_length)) {
+        pr_devel("%s: 文字の転送に失敗した。\n",__func__);
+        return -EFAULT;
+    }
+    
+    pr_devel("%s: read(val=%s)\n", __func__, result_char);
+    return result_length;
 }
 
 static ssize_t distance_write(struct file *fp, const char __user *buf, size_t count, loff_t *f_pos) {
