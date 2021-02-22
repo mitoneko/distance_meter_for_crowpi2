@@ -2,6 +2,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/types.h>
+#include <linux/ctype.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
@@ -32,8 +33,9 @@ struct distance_device_info {
     ktime_t echo_start;
     int echo_length; // 単位:ns 信号幅は、ハードウェア定義により32ms以下である。
     bool is_measuring;
-    struct timer_list ringing_timer;
-    unsigned long ringing_time_jiffies; // 鳴動時間(単位:jiffies) 0で永遠
+    struct timer_list timer_for_measure;
+    unsigned long measure_span_jiffies; // 鳴動時間(単位:jiffies) 0で永遠
+    struct timer_list timer_for_triger_stop;
 };
 
 // /dev/distance配下のアクセス関数
@@ -65,23 +67,6 @@ static ssize_t distance_read(struct file *fp, char __user *buf, size_t count, lo
     if (buf == NULL) return -EINVAL;
     if (ddev == NULL) return -EBADF;
 
-    gpiod_set_value(ddev->trig_gpio, 1);
-    ddev->is_measuring = true;
-    msleep(1);
-    gpiod_set_value(ddev->trig_gpio, 0);
-
-    // is_measuring信号が落ちるまで待つ。
-    // echo_irq_handlerにて、立ち上げ・立ち下がりの処理完了で落ちる。
-    // ハードウェア仕様により38ms+パルス発信幅+アルファで落ちるはず。
-    timeout_jiffies = jiffies;
-    while (ddev->is_measuring == true) {
-        if ( jiffies - timeout_jiffies > 10) {
-            pr_devel("%s: echoの戻り信号検知が出来ない。\n", __func__);
-            return -EIO;
-        }
-        msleep(1);
-    }
-
     result_mm = ddev->echo_length / 5686; //datasheetだと5400。実測で補正
     result_length = snprintf(result_char, result_char_size, "%d\n", result_mm);
     if (result_length > count) result_length=count;
@@ -108,20 +93,64 @@ static irqreturn_t echo_irq_handler(int irq, void *device) {
 }
         
 
+/* "on"または"1"で始まる文字列なら測定を開始。
+ * "off"または、"0"で始まる文字列なら、測定を停止。*/
+void measure_start(struct timer_list *timer); 
 static ssize_t distance_write(struct file *fp, const char __user *buf, size_t count, loff_t *f_pos) {
+    char write_str[4];
+    size_t write_count;
+    int result;
+    char *i;
+
     pr_devel("%s: wrote.\n", __func__);
+
+    write_count = (count>3) ? 3 : count;
+    result = copy_from_user(write_str, buf, write_count);
+    if (result != 0) {
+        pr_devel("%s: 書き込まれた文字のコピーに失敗\n", __func__);
+        return -EFAULT;
+    }
+    write_str[3]=0;
+
+    for (i = write_str; *i!=0 ; i++) {
+        *i = tolower(i);
+    }
+    if ((write_str[0]=='o' && write_str[1]=='n') || write_str[0]=='1') {
+        if (ddev->is_measuring==false && ddev->echo_length==0) {
+            ddev->echo_start = 0;
+            ddev->echo_length = 0;
+            measure_start(ddev->timer_for_measure);
+            pr_devel("%s: タイマースタート\n", __func__);
+        }
+    } else if ((write_str[0]=='o' && write_str[1]=='f' && write_str[2]=='f') || write_str[0]=='0' ){
+        del_timer(ddev->timer_for_measure);
+        del_timer(ddev->timer_for_triger_stop);
+        ddev->is_measuring = false;
+        ddev->echo_start = 0;
+        ddev->echo_length = 0;
+        pr_devel("%s: タイマー停止\n", __func__);
+    }
+    
     return count;
 }
 
-/* 仮に残しておく */
-void beep_off_when_timeup(struct timer_list *timer) {
-    struct distance_device_info *ddev = container_of(timer, struct distance_device_info, ringing_timer);
-    if (!ddev) {
-        pr_err("%s:デバイス情報取得失敗\n", __func__);
-        return;
-    }
+/* 定期的に測定を開始する　*/
+void measure_start(struct timer_list *timer) {
+    struct distance_device_info *ddev = container_of(timer, struct distance_device_info, timer_for_measure);
+    
+    gpiod_set_value(ddev->trig_gpio, 1);
+    ddev->is_measuring = true;
+    mod_timer(ddev->timer_for_triger_stop, jiffies+1); // 1tickの待ちでも長過ぎるくらい。
+    mod_timer(ddev->timer_for_measure, jiffies+ddev->measure_span_jiffies); // タイマー再起動
 }
 
+/* トリガー信号停止(measure_startからのタイマー起動) */
+void triger_signal_stop(struct timer_list *timer) {
+    struct distance_device_info *ddev = container_of(timer, struct distance_device_info, timer_for_triger_stop);
+
+    gpiod_set_value(ddev->trig_gpio, 0);
+}
+ 
 /* 仮に残しておく */
 /*
 static long beep_ioctl(struct file *fp, unsigned int cmd, unsigned long palm) {
@@ -331,9 +360,9 @@ static int distance_probe(struct platform_device *p_dev) {
     }
     
     // timerの生成
-    // 多分作ることになる
-    //timer_setup(&ddev->ringing_timer, beep_off_when_timeup, 0);
-    //ddev->ringing_time_jiffies = msecs_to_jiffies(3000);
+    timer_setup(&ddev->timer_for_measure, measure_start, 0);
+    ddev->measure_span_jiffies= msecs_to_jiffies(100);
+    timer_setup(&ddev->timer_for_triger_stop, triger_signal_stop, 0);
 
     pr_info("%s:distance meter driver init\n",__func__);
     return 0;
@@ -369,8 +398,8 @@ static int distance_remove(struct platform_device *p_dev) {
         gpiod_put(ddev->trig_gpio);
     }
 
-    //多分、復活する.
-    //del_timer(&ddev->ringing_timer);
+    del_timer(&ddev->timer_for_measure);
+    del_timer(&ddev->timer_for_triger_stop);
 
     pr_info("%s:distance meter driver unloaded\n",__func__);
     return 0;
