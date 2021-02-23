@@ -238,25 +238,26 @@ static void remove_udev(struct distance_device_info *ddev) {
 }
 
 // sysfs ringing_timeの読み込みと書き込み
-/* 仮に残す
-static ssize_t read_beep_ringing_time(struct device *dev, struct device_attribute *attr, char *buf) {
+static ssize_t read_measure_span(struct device *dev, struct device_attribute *attr, char *buf) {
     struct distance_device_info *ddev = dev_get_drvdata(dev);
+    int result;
     if (!ddev) {
         pr_err("%s: デバイス情報の取得に失敗しました。\n", __func__);
         return -EFAULT;
     }
-    return snprintf(buf, PAGE_SIZE, "%s\n", "kari");
+    result = jiffies_to_msecs(ddev->measure_span_jiffies);
+    return snprintf(buf, PAGE_SIZE, "%d\n", result);
 }
 
-#define MAX_LENGTH_LONG_NUM 11 // unsigned longの最大値　4,294,967,295
-static ssize_t write_beep_ringing_time(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
-    struct beep_device_info *bdev;
+#define MAX_LENGTH_LONG_NUM 11 // unsigned intの最大値　4,294,967,295
+static ssize_t write_measure_span(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+    struct distance_device_info *ddev;
     char source[MAX_LENGTH_LONG_NUM];
     unsigned int time_ms;
     int result;
 
-    bdev = dev_get_drvdata(dev);
-    if (!bdev) {
+    ddev = dev_get_drvdata(dev);
+    if (!ddev) {
         pr_err("%s: デバイス情報の取得に失敗しました。\n", __func__);
         return -EFAULT;
     }
@@ -272,31 +273,31 @@ static ssize_t write_beep_ringing_time(struct device *dev, struct device_attribu
         pr_err("%s: 引数がおかしい(%s)\n",__func__, source);
         return -EINVAL;
     }
+    if (time_ms < 50) time_ms=50;
 
-    bdev->ringing_time_jiffies = msecs_to_jiffies(time_ms);
-    pr_devel("%s: ringing_timeをセットしました。(msec=%d)(jiffies=%ld)\n", 
-            __func__, time_ms, bdev->ringing_time_jiffies);
+    ddev->measure_span_jiffies = msecs_to_jiffies(time_ms);
+    pr_devel("%s: 測定間隔をセットしました。(msec=%d)(jiffies=%ld)\n", 
+            __func__, time_ms, ddev->measure_span_jiffies);
     return count;
 }
-*/
 
-// sysfs(/sys/device/platform/beep@0/beep_ringing_time)の生成
-static struct device_attribute dev_attr_beep_ringing_time = {
+// sysfs(/sys/device/platform/distance)の生成
+static struct device_attribute dev_attr_measure_span = {
     .attr = {
-        .name = "hennsuuno_namae_ni_naru",
-        .mode = S_IRUGO | S_IWUGO,
+        .name = "measure_span_ms",
+        .mode = S_IRUGO | S_IWUSR,
     },
-    .show = NULL,
-    .store = NULL,
+    .show = read_measure_span,
+    .store = write_measure_span,
 };
 
 static int make_sysfs(struct device *dev) {
-    //return device_create_file(dev, &dev_attr_beep_ringing_time);
+    return device_create_file(dev, &dev_attr_measure_span);
     return 0;
 }
 
 static void remove_sysfs(struct device *dev) {
-    //device_remove_file(dev, &dev_attr_beep_ringing_time);
+    device_remove_file(dev, &dev_attr_measure_span);
 }
 
 // ドライバの初期化　及び　後始末
@@ -435,4 +436,4 @@ module_platform_driver(distance_driver);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("This is distance meter driver for crowpi2");
 MODULE_AUTHOR("mito");
-
+MODULE_VERSION("0.0.0");
