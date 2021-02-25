@@ -78,67 +78,13 @@ static ssize_t distance_read(struct file *fp, char __user *buf, size_t count, lo
     return result_length;
 }
 
-        
-
-/* "on"または"1"で始まる文字列なら測定を開始。
- * "off"または、"0"で始まる文字列なら、測定を停止。*/
-void measure_start(struct timer_list *timer); 
-static DEFINE_MUTEX(status_change); // タイマーの起動・停止作業中のロック
-
-static ssize_t distance_write(struct file *fp, const char __user *buf, size_t count, loff_t *f_pos) {
-    struct distance_device_info *ddev = fp->private_data;
-    char write_str[4];
-    size_t write_count;
-    int result;
-    char *i;
-
-    pr_devel("%s: wrote.\n", __func__);
-
-    write_count = (count>3) ? 3 : count;
-    result = copy_from_user(write_str, buf, write_count);
-    if (result != 0) {
-        pr_devel("%s: 書き込まれた文字のコピーに失敗\n", __func__);
-        return -EFAULT;
-    }
-    write_str[3]=0;
-
-    for (i = write_str; *i!=0 ; i++) {
-        *i = tolower(*i);
-    }
-    if ((write_str[0]=='o' && write_str[1]=='n') || write_str[0]=='1') {
-        mutex_lock(&status_change);
-        if ( !ddev->is_timer_on ) {
-            ddev->is_timer_on = true;
-            ddev->echo_start = 0;
-            ddev->echo_length = 0;
-            measure_start(&ddev->timer_for_measure);
-            pr_devel("%s: タイマースタート\n", __func__);
-        }
-        mutex_unlock(&status_change);
-    } else if ((write_str[0]=='o' && write_str[1]=='f' && write_str[2]=='f') || write_str[0]=='0' ){
-        mutex_lock(&status_change);
-        if ( ddev->is_timer_on ) {
-            del_timer(&ddev->timer_for_measure);
-            del_timer(&ddev->timer_for_triger_stop);
-            gpiod_set_value(ddev->trig_gpio, 0);
-            ddev->echo_start = 0;
-            ddev->echo_length = 0;
-            msleep(50); // 最終のトリガ停止後、次回スタートまで最低50ms必要。
-            ddev->is_timer_on = false;
-            pr_devel("%s: タイマー停止\n", __func__);
-        }
-        mutex_unlock(&status_change);
-    }
-    
-    return count;
-}
-
-/* 定期的に測定を開始する　*/
+/* 測定を開始する。測定開始後、次回タイマーを再起動する。　*/
 void measure_start(struct timer_list *timer) {
     struct distance_device_info *ddev = container_of(timer, struct distance_device_info, timer_for_measure);
     
     gpiod_set_value(ddev->trig_gpio, 1);
     mod_timer(&ddev->timer_for_triger_stop, jiffies+1); // 1tickの待ちでも長過ぎるくらい。
+    // この後、エコー信号の受信は、割込み関数echo_irq_handlerにて処理される。
     mod_timer(&ddev->timer_for_measure, jiffies+ddev->measure_span_jiffies); // タイマー再起動
 }
 
@@ -161,28 +107,41 @@ static irqreturn_t echo_irq_handler(int irq, void *device) {
     return IRQ_HANDLED;
 }
 
-/* 仮に残しておく */
-/*
-static long beep_ioctl(struct file *fp, unsigned int cmd, unsigned long palm) {
-    // cmd=1のみ有効。palmの値でringing_time_jiffiesを更新する。
-    if (cmd == 1) {
-        struct beep_device_info *bdev = fp->private_data;
-        bdev->ringing_time_jiffies = msecs_to_jiffies((unsigned int)palm);
-        pr_devel("%s: 鳴動時間変更(jiffies=%ld)(msec=%d)\n",
-                __func__, bdev->ringing_time_jiffies, (unsigned int)palm); 
+static DEFINE_MUTEX(status_change); // タイマーの起動・停止作業中のロック
+
+/* 測定用タイマーを起動する。 */
+void measure_timer_start(struct distance_device_info *ddev) {
+    mutex_lock(&status_change);
+    if ( !ddev->is_timer_on ) {
+        ddev->is_timer_on = true;
+        ddev->echo_start = 0;
+        ddev->echo_length = 0;
+        measure_start(&ddev->timer_for_measure);
+        pr_devel("%s: タイマースタート\n", __func__);
     }
-    return 0;
+    mutex_unlock(&status_change);
 }
-*/
+
+/* 測定用タイマーを停止する。 */
+void measure_timer_stop(struct distance_device_info *ddev) {
+    mutex_lock(&status_change);
+    if ( ddev->is_timer_on ) {
+        del_timer(&ddev->timer_for_measure);
+        del_timer(&ddev->timer_for_triger_stop);
+        gpiod_set_value(ddev->trig_gpio, 0);
+        ddev->echo_start = 0;
+        ddev->echo_length = 0;
+        ddev->is_timer_on = false;
+        pr_devel("%s: タイマー停止\n", __func__);
+    }
+    mutex_unlock(&status_change);
+}
 
 /* ハンドラ　テーブル */
 struct file_operations distance_fops = {
     .open     = distance_open,
     .release  = distance_close,
     .read     = distance_read,
-    .write    = distance_write,
-    .unlocked_ioctl = NULL,
-    .compat_ioctl = NULL,
 };
 
 // キャラクタデバイスの登録と、/dev/beep0の生成
@@ -228,13 +187,29 @@ err:
     return ret;
 }
 
-// キャラクタデバイス及び/dev/distanceの登録解除
-static void remove_udev(struct distance_device_info *ddev) {
-    dev_t dev = MKDEV(ddev->major, MINOR_BASE);
-    device_destroy(ddev->class, MKDEV(ddev->major, 0));
-    class_destroy(ddev->class); /* クラス登録解除 */
-    cdev_del(&ddev->cdev); /* デバイス除去 */
-    unregister_chrdev_region(dev, MINOR_NUM); /* メジャー番号除去 */
+// sysfs 測定の開始と停止の設定と設定の読み出し
+static ssize_t read_run_timer(struct device *dev, struct device_attribute *attr, char*buf) {
+    struct distance_device_info *ddev = dev_get_drvdata(dev);
+    return snprintf(buf, PAGE_SIZE, "%d\n", (int)ddev->is_timer_on);
+}
+
+static ssize_t write_run_timer(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+    struct distance_device_info *ddev = dev_get_drvdata(dev);
+    if (count > 2) return -EINVAL;
+    if (count == 2 && buf[1]!='\n') return -EINVAL;
+
+    switch (buf[0]) {
+        case '1':
+            measure_timer_start(ddev);
+            break;
+        case '0':
+            measure_timer_stop(ddev);
+            break;
+        default:
+            return -EINVAL;
+    }
+
+    return count;
 }
 
 // sysfs ringing_timeの読み込みと書き込み
@@ -280,8 +255,27 @@ static ssize_t write_measure_span(struct device *dev, struct device_attribute *a
             __func__, time_ms, ddev->measure_span_jiffies);
     return count;
 }
+// キャラクタデバイス及び/dev/distanceの登録解除
+static void remove_udev(struct distance_device_info *ddev) {
+    dev_t dev = MKDEV(ddev->major, MINOR_BASE);
+    device_destroy(ddev->class, MKDEV(ddev->major, 0));
+    class_destroy(ddev->class); /* クラス登録解除 */
+    cdev_del(&ddev->cdev); /* デバイス除去 */
+    unregister_chrdev_region(dev, MINOR_NUM); /* メジャー番号除去 */
+}
 
-// sysfs(/sys/device/platform/distance)の生成
+
+// sysfs(/sys/device/platform/run_timer)の設定
+static struct device_attribute dev_attr_run_timer = {
+    .attr = {
+        .name = "run_timer",
+        .mode = S_IRUGO | S_IWUSR,
+    },
+    .show = read_run_timer,
+    .store = write_run_timer,
+};
+
+// sysfs(/sys/device/platform/distance)の設定
 static struct device_attribute dev_attr_measure_span = {
     .attr = {
         .name = "measure_span_ms",
@@ -291,13 +285,21 @@ static struct device_attribute dev_attr_measure_span = {
     .store = write_measure_span,
 };
 
+// sysfsの生成と削除
 static int make_sysfs(struct device *dev) {
-    return device_create_file(dev, &dev_attr_measure_span);
-    return 0;
+    int result;
+    result = device_create_file(dev, &dev_attr_measure_span);
+    if (result != 0) return result;
+    result = device_create_file(dev, &dev_attr_run_timer);
+    if (result != 0) {
+        device_remove_file(dev, &dev_attr_measure_span);
+    }
+    return result;
 }
 
 static void remove_sysfs(struct device *dev) {
     device_remove_file(dev, &dev_attr_measure_span);
+    device_remove_file(dev, &dev_attr_run_timer);
 }
 
 // ドライバの初期化　及び　後始末
@@ -328,8 +330,6 @@ static int distance_probe(struct platform_device *p_dev) {
         goto err;
     }
     dev_set_drvdata(dev, ddev);
-    ddev->echo_start = 0;
-    ddev->echo_length = 0;
     ddev->is_timer_on = false;
 
     // gpioの確保と初期化
@@ -358,7 +358,6 @@ static int distance_probe(struct platform_device *p_dev) {
         goto err_echo_irq;
     }
 
-
     // udevの生成
     result = make_udev(ddev, p_dev->name);
     if (result != 0) {
@@ -377,6 +376,9 @@ static int distance_probe(struct platform_device *p_dev) {
     timer_setup(&ddev->timer_for_measure, measure_start, 0);
     ddev->measure_span_jiffies= msecs_to_jiffies(100);
     timer_setup(&ddev->timer_for_triger_stop, triger_signal_stop, 0);
+
+    //　測定処理を開始する。
+    measure_timer_start(ddev);
 
     pr_info("%s:distance meter driver init\n",__func__);
     return 0;
@@ -397,24 +399,18 @@ static int distance_remove(struct platform_device *p_dev) {
     struct distance_device_info *ddev = dev_get_drvdata(&p_dev->dev);
     int echo_irq;
 
-    remove_udev(ddev);
-    remove_sysfs(&p_dev->dev);
-
+    // 現在測定中の処理を停止する。起動中のタイマーはこれで削除される。
+    measure_timer_stop(ddev);
+    
     // echo_gpio 割り込みハンドラの開放
     echo_irq = gpiod_to_irq(ddev->echo_gpio);
     free_irq(echo_irq, ddev);
 
-    // gpioデバイスの開放
-    if (ddev->echo_gpio) {
-        gpiod_put(ddev->echo_gpio);
-    }
-    if (ddev->trig_gpio) {
-        gpiod_set_value(ddev->trig_gpio, 0);
-        gpiod_put(ddev->trig_gpio);
-    }
+    // gpioデバイスは、デバイスの開放と同時に、開放される。
 
-    del_timer(&ddev->timer_for_measure);
-    del_timer(&ddev->timer_for_triger_stop);
+    // udev及びsysfsの開放
+    remove_udev(ddev);
+    remove_sysfs(&p_dev->dev);
 
     pr_info("%s:distance meter driver unloaded\n",__func__);
     return 0;
