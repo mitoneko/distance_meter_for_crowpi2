@@ -187,13 +187,29 @@ err:
     return ret;
 }
 
-// キャラクタデバイス及び/dev/distanceの登録解除
-static void remove_udev(struct distance_device_info *ddev) {
-    dev_t dev = MKDEV(ddev->major, MINOR_BASE);
-    device_destroy(ddev->class, MKDEV(ddev->major, 0));
-    class_destroy(ddev->class); /* クラス登録解除 */
-    cdev_del(&ddev->cdev); /* デバイス除去 */
-    unregister_chrdev_region(dev, MINOR_NUM); /* メジャー番号除去 */
+// sysfs 測定の開始と停止の設定と設定の読み出し
+static ssize_t read_run_timer(struct device *dev, struct device_attribute *attr, char*buf) {
+    struct distance_device_info *ddev = dev_get_drvdata(dev);
+    return snprintf(buf, PAGE_SIZE, "%d\n", (int)ddev->is_timer_on);
+}
+
+static ssize_t write_run_timer(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+    struct distance_device_info *ddev = dev_get_drvdata(dev);
+    if (count > 2) return -EINVAL;
+    if (count == 2 && buf[1]!='\n') return -EINVAL;
+
+    switch (buf[0]) {
+        case '1':
+            measure_timer_start(ddev);
+            break;
+        case '0':
+            measure_timer_stop(ddev);
+            break;
+        default:
+            return -EINVAL;
+    }
+
+    return count;
 }
 
 // sysfs ringing_timeの読み込みと書き込み
@@ -239,8 +255,27 @@ static ssize_t write_measure_span(struct device *dev, struct device_attribute *a
             __func__, time_ms, ddev->measure_span_jiffies);
     return count;
 }
+// キャラクタデバイス及び/dev/distanceの登録解除
+static void remove_udev(struct distance_device_info *ddev) {
+    dev_t dev = MKDEV(ddev->major, MINOR_BASE);
+    device_destroy(ddev->class, MKDEV(ddev->major, 0));
+    class_destroy(ddev->class); /* クラス登録解除 */
+    cdev_del(&ddev->cdev); /* デバイス除去 */
+    unregister_chrdev_region(dev, MINOR_NUM); /* メジャー番号除去 */
+}
 
-// sysfs(/sys/device/platform/distance)の生成
+
+// sysfs(/sys/device/platform/run_timer)の設定
+static struct device_attribute dev_attr_run_timer = {
+    .attr = {
+        .name = "run_timer",
+        .mode = S_IRUGO | S_IWUSR,
+    },
+    .show = read_run_timer,
+    .store = write_run_timer,
+};
+
+// sysfs(/sys/device/platform/distance)の設定
 static struct device_attribute dev_attr_measure_span = {
     .attr = {
         .name = "measure_span_ms",
@@ -250,13 +285,21 @@ static struct device_attribute dev_attr_measure_span = {
     .store = write_measure_span,
 };
 
+// sysfsの生成と削除
 static int make_sysfs(struct device *dev) {
-    return device_create_file(dev, &dev_attr_measure_span);
-    return 0;
+    int result;
+    result = device_create_file(dev, &dev_attr_measure_span);
+    if (result != 0) return result;
+    result = device_create_file(dev, &dev_attr_run_timer);
+    if (result != 0) {
+        device_remove_file(dev, &dev_attr_measure_span);
+    }
+    return result;
 }
 
 static void remove_sysfs(struct device *dev) {
     device_remove_file(dev, &dev_attr_measure_span);
+    device_remove_file(dev, &dev_attr_run_timer);
 }
 
 // ドライバの初期化　及び　後始末
@@ -359,21 +402,15 @@ static int distance_remove(struct platform_device *p_dev) {
     // 現在測定中の処理を停止する。起動中のタイマーはこれで削除される。
     measure_timer_stop(ddev);
     
-    // udev及びsysfsの開放
-    remove_udev(ddev);
-    remove_sysfs(&p_dev->dev);
-
     // echo_gpio 割り込みハンドラの開放
     echo_irq = gpiod_to_irq(ddev->echo_gpio);
     free_irq(echo_irq, ddev);
 
-    // gpioデバイスの開放
-    if (ddev->echo_gpio) {
-        gpiod_put(ddev->echo_gpio);
-    }
-    if (ddev->trig_gpio) {
-        gpiod_put(ddev->trig_gpio);
-    }
+    // gpioデバイスは、デバイスの開放と同時に、開放される。
+
+    // udev及びsysfsの開放
+    remove_udev(ddev);
+    remove_sysfs(&p_dev->dev);
 
     pr_info("%s:distance meter driver unloaded\n",__func__);
     return 0;
